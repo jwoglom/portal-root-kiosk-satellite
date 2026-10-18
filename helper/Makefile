@@ -1,9 +1,10 @@
-SDK ?= /home/jxlarrea/android-sdk
+SDK ?= $(if $(ANDROID_SDK_ROOT),$(ANDROID_SDK_ROOT),/home/jxlarrea/android-sdk)
 NDK ?= $(SDK)/ndk/28.2.13676358
-TOOLCHAIN ?= $(NDK)/toolchains/llvm/prebuilt/linux-x86_64
+HOST_TAG ?= $(if $(filter Darwin,$(shell uname -s)),darwin-x86_64,linux-x86_64)
+TOOLCHAIN ?= $(NDK)/toolchains/llvm/prebuilt/$(HOST_TAG)
 NATIVE_CC := $(TOOLCHAIN)/bin/armv7a-linux-androideabi29-clang
 NATIVE_CC_API28 := $(TOOLCHAIN)/bin/armv7a-linux-androideabi28-clang
-BUILD_TOOLS ?= $(SDK)/build-tools/37.0.0
+BUILD_TOOLS ?= $(SDK)/build-tools/$(or $(shell ls $(SDK)/build-tools 2>/dev/null | sort -V | tail -n 1),37.0.0)
 ANDROID_JAR ?= $(SDK)/platforms/android-36/android.jar
 BUILD := build
 CLASSES := $(BUILD)/classes
@@ -13,7 +14,7 @@ ALIGNED := $(BUILD)/portal-audio-helper-aligned.apk
 APK := $(BUILD)/portal-audio-helper.apk
 PERSIST_SO := $(BUILD)/libportal_audio_persist.so
 PERSIST_JAVA_SO := $(BUILD)/libportal_audio_persist_java.so
-KEYSTORE ?= /home/jxlarrea/.android/debug.keystore
+KEYSTORE ?= $(HOME)/.android/debug.keystore
 SOURCES := $(shell find src -name '*.java' -type f)
 
 .PHONY: all clean native native-java

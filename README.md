@@ -132,8 +132,9 @@ adb shell uname -a
 ### 1. Install and configure the host tools
 
 Install the tools listed under [Requirements](#requirements), then clone the
-repository and point the build at your Android SDK. Adjust the Build Tools path
-if your installed version differs.
+repository and point the build at your Android SDK. The Makefiles use the
+newest Build Tools installed under the SDK; set `BUILD_TOOLS` and `D8` only to
+pin a specific version. On macOS the SDK is usually `$HOME/Library/Android/sdk`.
 
 ```sh
 git clone https://github.com/jxlarrea/portal-root-kiosk-satellite.git
@@ -142,8 +143,10 @@ cd portal-root-kiosk-satellite
 export ANDROID_SDK_ROOT="$HOME/Android/Sdk"
 export NDK="$ANDROID_SDK_ROOT/ndk/28.2.13676358"
 export ANDROID_JAR="$ANDROID_SDK_ROOT/platforms/android-36/android.jar"
-export BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/37.0.0"
-export D8="$BUILD_TOOLS/d8"
+
+# Optional: pin a specific Build Tools version instead of the newest installed.
+# export BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/37.0.0"
+# export D8="$BUILD_TOOLS/d8"
 ```
 
 ### 2. Prepare the Portal

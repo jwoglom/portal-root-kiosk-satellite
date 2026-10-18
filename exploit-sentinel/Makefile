@@ -1,5 +1,5 @@
 SDK ?= $(if $(ANDROID_SDK_ROOT),$(ANDROID_SDK_ROOT),/home/jxlarrea/android-sdk)
-BUILD_TOOLS ?= $(SDK)/build-tools/37.0.0
+BUILD_TOOLS ?= $(SDK)/build-tools/$(or $(shell ls $(SDK)/build-tools 2>/dev/null | sort -V | tail -n 1),37.0.0)
 ANDROID_JAR ?= $(SDK)/platforms/android-36/android.jar
 KEYSTORE ?= $(HOME)/.android/debug.keystore
 BUILD := build

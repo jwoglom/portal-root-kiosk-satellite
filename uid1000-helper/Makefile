@@ -1,12 +1,13 @@
 SDK ?= $(if $(ANDROID_SDK_ROOT),$(ANDROID_SDK_ROOT),/home/jxlarrea/android-sdk)
 NDK ?= $(SDK)/ndk/28.2.13676358
-TOOLCHAIN ?= $(NDK)/toolchains/llvm/prebuilt/linux-x86_64
+HOST_TAG ?= $(if $(filter Darwin,$(shell uname -s)),darwin-x86_64,linux-x86_64)
+TOOLCHAIN ?= $(NDK)/toolchains/llvm/prebuilt/$(HOST_TAG)
 CXX := $(TOOLCHAIN)/bin/aarch64-linux-android29-clang++
 CC := $(TOOLCHAIN)/bin/aarch64-linux-android29-clang
 OBJCOPY := $(TOOLCHAIN)/bin/llvm-objcopy
 JAVAC ?= javac
-D8 ?= $(SDK)/build-tools/36.0.0/d8
-BUILD_TOOLS ?= $(SDK)/build-tools/37.0.0
+D8 ?= $(BUILD_TOOLS)/d8
+BUILD_TOOLS ?= $(SDK)/build-tools/$(or $(shell ls $(SDK)/build-tools 2>/dev/null | sort -V | tail -n 1),37.0.0)
 ANDROID_JAR ?= $(SDK)/platforms/android-36/android.jar
 KEYSTORE ?= $(HOME)/.android/debug.keystore
 BUILD := build
@@ -42,7 +43,7 @@ $(HOOK_OBJECT): native/boot_hook.S
 
 $(HOOK): $(HOOK_OBJECT)
 	$(OBJCOPY) --only-section=.text -O binary $< $@
-	test "$$(stat -c %s $@)" -le 316
+	test "$$(wc -c < $@ | tr -d ' ')" -le 316
 
 $(ALOHA_LIBRARY): native/portal_camera_led_watch.cpp native/portal_camera_led_jni.cpp
 	mkdir -p $(BUILD)
@@ -70,7 +71,7 @@ $(ALOHA_HOOK_OBJECT): native/boot_hook_runtime.S
 
 $(ALOHA_HOOK): $(ALOHA_HOOK_OBJECT)
 	$(OBJCOPY) --only-section=.text -O binary $< $@
-	test "$$(stat -c %s $@)" -le 32768
+	test "$$(wc -c < $@ | tr -d ' ')" -le 32768
 
 $(ALOHA_APK): AndroidManifest.xml $(ALOHA_LIBRARY) $(ALOHA_BOOTSTRAP) $(KEYSTORE)
 	rm -rf $(ALOHA_APK_STAGE) $(ALOHA_APK_UNSIGNED) $(ALOHA_APK_ALIGNED) $@

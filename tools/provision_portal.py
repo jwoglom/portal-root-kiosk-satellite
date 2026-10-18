@@ -333,6 +333,7 @@ class PortalProvisioner:
         self.meta_accounts_finalize_only = meta_accounts_finalize_only
         self.adb = ["adb", "-s", serial]
         self.target: PortalTarget | None = None
+        self._bundled_simpleperf_device_path: str | None = None
         self.persist_wireless_adb = False
 
     def uid1000_path(self, name: str) -> str:
@@ -3150,89 +3151,198 @@ class PortalProvisioner:
         )
         return True
 
+    def device_api(self) -> int:
+        value = self.adb_run(
+            ["shell", "getprop", "ro.build.version.sdk"], timeout=5, check=True
+        ).stdout.strip()
+        try:
+            return int(value)
+        except ValueError:
+            raise ProvisionError(
+                f"could not read device API level (got {value!r})"
+            )
+
+    def bundled_simpleperf_candidates(self) -> list[pathlib.Path]:
+        roots: list[pathlib.Path] = []
+        for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK"):
+            value = os.environ.get(name)
+            if value:
+                roots.append(pathlib.Path(value))
+        roots.extend(
+            (
+                # macOS Android Studio default, then common Linux/manual roots.
+                pathlib.Path.home() / "Library/Android/sdk/ndk",
+                pathlib.Path.home() / "android-sdk/ndk",
+                pathlib.Path.home() / "Android/Sdk/ndk",
+            )
+        )
+        rel = "simpleperf/bin/android/arm64/simpleperf"
+        candidates: list[pathlib.Path] = []
+        seen: set[pathlib.Path] = set()
+        for root in roots:
+            globbed = (
+                sorted(root.glob("*/" + rel), reverse=True)
+                if root.is_dir()
+                else []
+            )
+            for candidate in [root / rel, *globbed]:
+                if candidate.is_file():
+                    resolved = candidate.resolve()
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        candidates.append(candidate)
+        return candidates
+
+    def ensure_bundled_simpleperf(self) -> str:
+        if self._bundled_simpleperf_device_path is not None:
+            return self._bundled_simpleperf_device_path
+        candidates = self.bundled_simpleperf_candidates()
+        if not candidates:
+            raise ProvisionError(
+                "this target needs the Android NDK arm64 simpleperf binary; "
+                "set ANDROID_NDK_HOME to the installed NDK directory"
+            )
+        device_path = "/data/local/tmp/portal-simpleperf"
+        # The NDK's declared minSdk is not a reliable compatibility signal:
+        # r28c declares API 35 yet links on API 28, while r29 declares API 36
+        # and fails to resolve _Unwind_Resume at runtime. Probe each candidate
+        # on the device and keep the first that actually links and runs.
+        failures: list[str] = []
+        for candidate in candidates:
+            self.adb_run(
+                ["push", str(candidate), device_path], timeout=120, check=True
+            )
+            self.adb_run(
+                ["shell", "chmod", "0755", device_path], timeout=20, check=True
+            )
+            probe = self.adb_run(
+                ["shell", f"{shlex.quote(device_path)} --version 2>&1"],
+                timeout=20,
+            )
+            if "Simpleperf version" in probe.stdout:
+                self._bundled_simpleperf_device_path = device_path
+                print(f"SIMPLEPERF_SELECTED source={candidate}", flush=True)
+                return device_path
+            lines = [line for line in probe.stdout.splitlines() if line.strip()]
+            failures.append(f"{candidate}: {lines[-1] if lines else 'no output'}")
+        self.adb_run(["shell", "rm", "-f", device_path], timeout=5)
+        raise ProvisionError(
+            "no installed NDK simpleperf runs on this device (API "
+            f"{self.device_api()}); tried: " + "; ".join(failures)
+            + ". Install an NDK whose simpleperf links on this build "
+            "(e.g. r28c or r25c) or set ANDROID_NDK_HOME to it"
+        )
+
     def kaslr_base(self, tag: str) -> int:
         if self.target is None:
             raise ProvisionError("target must be selected before KASLR discovery")
         offsets = self.target.kaslr_pc_offsets
         simpleperf = "simpleperf"
         if self.target.bundled_simpleperf:
-            roots = []
-            for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK"):
-                value = os.environ.get(name)
-                if value:
-                    roots.append(pathlib.Path(value))
-            roots.extend(
-                (
-                    pathlib.Path.home() / "android-sdk/ndk",
-                    pathlib.Path.home() / "Android/Sdk/ndk",
-                )
-            )
-            candidates: list[pathlib.Path] = []
-            for root in roots:
-                if (root / "simpleperf/bin/android/arm64/simpleperf").is_file():
-                    candidates.append(root / "simpleperf/bin/android/arm64/simpleperf")
-                if root.is_dir():
-                    candidates.extend(
-                        sorted(
-                            root.glob("*/simpleperf/bin/android/arm64/simpleperf"),
-                            reverse=True,
-                        )
-                    )
-            local_simpleperf = next(
-                (candidate for candidate in candidates if candidate.is_file()),
-                None,
-            )
-            if local_simpleperf is None:
-                raise ProvisionError(
-                    "this target needs the Android NDK arm64 simpleperf binary; "
-                    "set ANDROID_NDK_HOME to the installed NDK directory"
-                )
-            simpleperf = "/data/local/tmp/portal-simpleperf"
+            simpleperf = self.ensure_bundled_simpleperf()
+        # Kernel PC sampling needs perf_event_paranoid <= 1. Stock Portal
+        # firmware ships security.perf_harden=1, which pins paranoid at 3 and
+        # blocks all unprivileged perf_event_open, so the capture would see no
+        # kernel addresses. Lower the harden flag for the capture (simpleperf's
+        # own app_profiler does the same), verify paranoid actually dropped,
+        # and restore the original value afterwards.
+        previous_harden = self.adb_run(
+            ["shell", "getprop", "security.perf_harden"], timeout=5
+        ).stdout.strip()
+        try:
             self.adb_run(
-                ["push", str(local_simpleperf), simpleperf],
-                timeout=120,
+                ["shell", "setprop", "security.perf_harden", "0"],
+                timeout=5,
                 check=True,
             )
-            self.adb_run(
-                ["shell", "chmod", "0755", simpleperf], timeout=20, check=True
-            )
-        for sample_try in range(3):
-            remote = f"/data/local/tmp/portal-perf-{tag}-{sample_try}.data"
-            command = (
-                f"{shlex.quote(simpleperf)} record -g -e cpu-clock -f 4000 "
-                "--duration 2 "
-                f"-o {shlex.quote(remote)} -- /system/bin/dd if=/dev/zero "
-                "of=/dev/null bs=4096"
-            )
-            self.adb_run(["shell", command], timeout=20)
-            # report-sample can emit several megabytes for a two-second sample.
-            # Filter on-device so remote ADB targets only transfer the kernel
-            # addresses used by the KASLR calculation.
-            report_command = (
-                f"{shlex.quote(simpleperf)} report-sample -i "
-                f"{shlex.quote(remote)} | "
-                "grep -m 512 'vaddr_in_file: ffffff'"
-            )
-            report = self.adb_run(["shell", report_command], timeout=60)
-            self.adb_run(["shell", "rm", "-f", remote], timeout=5)
-            values = [
-                int(value, 16)
-                for value in re.findall(
-                    r"vaddr_in_file: (ffffff[0-9a-f]+)", report.stdout
+            paranoid = ""
+            for _ in range(10):
+                paranoid = self.adb_run(
+                    ["shell", "cat", "/proc/sys/kernel/perf_event_paranoid"],
+                    timeout=5,
+                ).stdout.strip()
+                if paranoid.lstrip("-").isdigit() and int(paranoid) <= 1:
+                    break
+                time.sleep(0.5)
+            else:
+                raise ProvisionError(
+                    "kernel profiling is blocked: perf_event_paranoid stayed at "
+                    f"{paranoid or 'unknown'} after lowering security.perf_harden"
                 )
-            ]
-            candidates: collections.Counter[int] = collections.Counter()
-            for value in values:
-                for offset in offsets:
-                    base = value - offset
-                    if (
-                        base >= 0xFFFFFF8000000000
-                        and (base - 0xFFFFFF8008080000) & 0x1FFFFF == 0
-                    ):
-                        candidates[base] += 1
-            if candidates:
-                return candidates.most_common(1)[0][0]
-        raise ProvisionError("simpleperf did not expose a recognized kernel PC")
+            # Track why a boot's captures came up empty so the final error is
+            # actionable rather than generic. A single flaky capture should not
+            # abort the other tries, so per-try failures are recorded and the
+            # loop continues.
+            last_capture_note = ""
+            saw_kernel_samples = False
+            for sample_try in range(3):
+                remote = f"/data/local/tmp/portal-perf-{tag}-{sample_try}.data"
+                command = (
+                    f"{shlex.quote(simpleperf)} record -g -e cpu-clock -f 4000 "
+                    "--duration 2 "
+                    f"-o {shlex.quote(remote)} -- /system/bin/dd if=/dev/zero "
+                    "of=/dev/null bs=4096"
+                )
+                # simpleperf writes samples to -o, so merging its status output
+                # is safe and lets us report why a refused capture produced no
+                # data (adb's exit code does not reliably reflect the remote
+                # command across adb versions).
+                record = self.adb_run(
+                    ["shell", f"{command} 2>&1"], timeout=20
+                )
+                record_note = record.stdout.strip()
+                if record_note:
+                    last_capture_note = record_note
+                # report-sample can emit several megabytes for a two-second
+                # sample. Filter on-device so remote ADB targets only transfer
+                # the kernel addresses used by the KASLR calculation.
+                report_command = (
+                    f"{shlex.quote(simpleperf)} report-sample -i "
+                    f"{shlex.quote(remote)} | "
+                    "grep -m 512 'vaddr_in_file: ffffff'"
+                )
+                report = self.adb_run(["shell", report_command], timeout=60)
+                self.adb_run(["shell", "rm", "-f", remote], timeout=5)
+                values = [
+                    int(value, 16)
+                    for value in re.findall(
+                        r"vaddr_in_file: (ffffff[0-9a-f]+)", report.stdout
+                    )
+                ]
+                if values:
+                    saw_kernel_samples = True
+                candidates: collections.Counter[int] = collections.Counter()
+                for value in values:
+                    for offset in offsets:
+                        base = value - offset
+                        if (
+                            base >= 0xFFFFFF8000000000
+                            and (base - 0xFFFFFF8008080000) & 0x1FFFFF == 0
+                        ):
+                            candidates[base] += 1
+                if candidates:
+                    return candidates.most_common(1)[0][0]
+            if saw_kernel_samples:
+                # Capture worked but no sample matched the known offsets: the
+                # offset table is likely wrong for this firmware build.
+                raise ProvisionError(
+                    "simpleperf captured kernel PCs but none matched the "
+                    f"KASLR offsets for this build ({self.target.model})"
+                )
+            detail = f" (simpleperf: {last_capture_note})" if last_capture_note else ""
+            raise ProvisionError(
+                "simpleperf did not expose a recognized kernel PC" + detail
+            )
+        finally:
+            if previous_harden and previous_harden != "0":
+                try:
+                    self.adb_run(
+                        ["shell", "setprop", "security.perf_harden",
+                         previous_harden],
+                        timeout=5,
+                    )
+                except ProvisionError:
+                    pass
 
     def prepare_presence_helper(self) -> None:
         self.install_apk_preserving_verifier(
